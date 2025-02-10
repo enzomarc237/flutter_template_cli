@@ -1,4 +1,5 @@
 import 'package:args/command_runner.dart';
+import 'package:mason_logger/mason_logger.dart';
 import '../services/template_manager.dart';
 
 class RemoveCommand extends Command {
@@ -14,14 +15,23 @@ class RemoveCommand extends Command {
 
   @override
   void run() {
+    final logger = Logger();
     final name = argResults?['name'];
     
     if (name == null) {
-      print('Please provide the template name to remove');
+      logger.err('Please provide the template name to remove');
       return;
     }
 
-    TemplateManager().removeTemplate(name);
-    print('Template "$name" removed successfully!');
+    final templateManager = TemplateManager();
+    final template = templateManager.getTemplate(name);
+    
+    if (template == null) {
+      logger.err('Template "$name" not found');
+      return;
+    }
+
+    templateManager.removeTemplate(name);
+    logger.success('Template "$name" removed successfully!');
   }
 } 

@@ -1,0 +1,342 @@
+// lib/models/template.dart
+import 'package:freezed_annotation/freezed_annotation.dart';
+
+part 'template.freezed.dart';
+part 'template.g.dart';
+
+@freezed
+class Template with _$Template {
+  factory Template({
+    required String name,
+    required String repoUrl,
+    @Default([]) List<String> postCreateCommands,
+    @Default('main') String branch,
+    String? description,
+    @Default({}) Map<String, String> variables,
+    @Default(false) bool cached,
+    DateTime? lastUsed,
+  }) = _Template;
+
+  factory Template.fromJson(Map<String, dynamic> json) => _$TemplateFromJson(json);
+}
+
+// lib/services/template_manager.dart
+import 'package:path/path.dart' as path;
+import 'package:pubspec_parse/pubspec_parse.dart';
+
+class TemplateManager {
+  final File _storageFile;
+  final Directory _cacheDir;
+  List<Template> _templates = [];
+
+  TemplateManager()
+      : _storageFile = File(path.join(
+          Platform.environment['HOME'] ?? '',
+          '.flutter_template_cli',
+          'templates.json',
+        )),
+        _cacheDir = Directory(path.join(
+          Platform.environment['HOME'] ?? '',
+          '.flutter_template_cli',
+          'cache',
+        )) {
+    _initStorage();
+  }
+
+  Future<void> cacheTemplate(Template template) async {
+    final cacheFolder = path.join(_cacheDir.path, template.name);
+    final gitService = GitService();
+    
+    if (await gitService.cloneRepository(template.repoUrl, cacheFolder, branch: template.branch)) {
+      final updatedTemplate = template.copyWith(cached: true, lastUsed: DateTime.now());
+      updateTemplate(template.name, updatedTemplate);
+    }
+  }
+
+  Future<void> updateCache(String templateName) async {
+    final template = getTemplate(templateName);
+    if (template == null) return;
+
+    final cacheFolder = path.join(_cacheDir.path, template.name);
+    if (Directory(cacheFolder).existsSync()) {
+      await Process.run('git', ['pull'], workingDirectory: cacheFolder);
+    } else {
+      await cacheTemplate(template);
+    }
+  }
+
+  Future<bool> validateTemplate(String repoUrl, String branch) async {
+    try {
+      final tempDir = await Directory.systemTemp.createTemp('template_validation');
+      final gitService = GitService();
+      
+      if (!await gitService.cloneRepository(repoUrl, tempDir.path, branch: branch)) {
+        return false;
+      }
+
+      // Check for pubspec.yaml
+      final pubspecFile = File(path.join(tempDir.path, 'pubspec.yaml'));
+      if (!pubspecFile.existsSync()) {
+        return false;
+      }
+
+      // Validate pubspec.yaml
+      try {
+        final pubspecContent = pubspecFile.readAsStringSync();
+        Pubspec.parse(pubspecContent);
+      } catch (e) {
+        return false;
+      }
+
+      await tempDir.delete(recursive: true);
+      return true;
+    } catch (e) {
+      print('Error validating template: $e');
+      return false;
+    }
+  }
+}
+
+// lib/services/git_service.dart
+import 'package:git/git.dart';
+
+class GitService {
+  Future<bool> cloneRepository(String repoUrl, String targetPath, {String branch = 'main'}) async {
+    try {
+      final gitDir = await GitDir.init(Directory(targetPath));
+      
+      final result = await Process.run('git', [
+        'clone',
+        '-b',
+        branch,
+        repoUrl,
+        targetPath,
+      ]);
+
+      if (result.exitCode != 0) {
+        throw Exception('Failed to clone repository: ${result.stderr}');
+      }
+
+      // Clean up .git folder
+      await Directory(path.join(targetPath, '.git')).delete(recursive: true);
+      
+      return true;
+    } catch (e) {
+      print('Error cloning repository: $e');
+      return false;
+    }
+  }
+}
+
+// lib/services/project_creator.dart
+import 'package:mason/mason.dart';
+
+class ProjectCreator {
+  final GitService _gitService;
+  final TemplateManager _templateManager;
+  final Logger _logger;
+
+  ProjectCreator(this._gitService, this._templateManager, this._logger);
+
+  Future<bool> createProject(String templateName, String projectPath, Map<String, String> variables) async {
+    final template = _templateManager.getTemplate(templateName);
+    if (template == null) {
+      _logger.err('Template not found: $templateName');
+      return false;
+    }
+
+    _logger.info('Creating project from template: ${template.name}');
+    
+    // Use cached template if available
+    String sourceDir = path.join(_templateManager._cacheDir.path, template.name);
+    if (!template.cached || !Directory(sourceDir).existsSync()) {
+      _logger.info('Downloading template...');
+      final success = await _gitService.cloneRepository(
+        template.repoUrl,
+        projectPath,
+        branch: template.branch,
+      );
+      if (!success) return false;
+      sourceDir = projectPath;
+    } else {
+      _logger.info('Using cached template...');
+      await copyPath(sourceDir, projectPath);
+    }
+
+    // Apply template variables
+    final allVariables = {
+      ...template.variables,
+      ...variables,
+      'project_name': path.basename(projectPath),
+    };
+
+    await _processTemplateFiles(projectPath, allVariables);
+
+    // Execute post-create commands
+    _logger.info('Running post-create commands...');
+    for (final command in template.postCreateCommands) {
+      try {
+        final expandedCommand = _expandVariables(command, allVariables);
+        final parts = expandedCommand.split(' ');
+        
+        _logger.info('Executing: $expandedCommand');
+        final result = await Process.run(
+          parts.first,
+          parts.skip(1).toList(),
+          workingDirectory: projectPath,
+        );
+        
+        if (result.exitCode != 0) {
+          _logger.err('Command failed: $expandedCommand');
+          _logger.err(result.stderr);
+          return false;
+        }
+      } catch (e) {
+        _logger.err('Error executing command: $command');
+        _logger.err(e.toString());
+        return false;
+      }
+    }
+
+    _logger.success('Project created successfully! 🎉');
+    return true;
+  }
+
+  String _expandVariables(String input, Map<String, String> variables) {
+    String result = input;
+    variables.forEach((key, value) {
+      result = result.replaceAll('{{$key}}', value);
+    });
+    return result;
+  }
+
+  Future<void> _processTemplateFiles(String projectPath, Map<String, String> variables) async {
+    final dir = Directory(projectPath);
+    await for (final entity in dir.list(recursive: true)) {
+      if (entity is File) {
+        final content = await entity.readAsString();
+        final processedContent = _expandVariables(content, variables);
+        await entity.writeAsString(processedContent);
+      }
+    }
+  }
+}
+
+// lib/commands/create_command.dart
+class CreateCommand extends Command {
+  @override
+  String get name => 'create';
+
+  @override
+  String get description => 'Create a new Flutter project from template';
+
+  CreateCommand() {
+    argParser
+      ..addOption('template', abbr: 't', help: 'Template name to use')
+      ..addOption('name', abbr: 'n', help: 'Project name')
+      ..addMultiOption('var', abbr: 'v', help: 'Template variables (format: key=value)')
+      ..addFlag('update-cache', help: 'Update template cache before creating project');
+  }
+
+  @override
+  Future<void> run() async {
+    final templateName = argResults?['template'];
+    final projectName = argResults?['name'];
+    final updateCache = argResults?['update-cache'] ?? false;
+
+    if (templateName == null || projectName == null) {
+      print('Please provide both template name and project name');
+      return;
+    }
+
+    // Parse variables
+    final variables = <String, String>{};
+    for (final var_ in argResults?['var'] ?? []) {
+      final parts = var_.split('=');
+      if (parts.length == 2) {
+        variables[parts[0]] = parts[1];
+      }
+    }
+
+    final logger = Logger();
+    final templateManager = TemplateManager();
+    
+    if (updateCache) {
+      logger.info('Updating template cache...');
+      await templateManager.updateCache(templateName);
+    }
+
+    final creator = ProjectCreator(GitService(), templateManager, logger);
+    await creator.createProject(projectName, projectName, variables);
+  }
+}
+
+// lib/commands/add_command.dart
+class AddCommand extends Command {
+  @override
+  String get name => 'add';
+
+  @override
+  String get description => 'Add a new template';
+
+  AddCommand() {
+    argParser
+      ..addOption('name', abbr: 'n', help: 'Template name')
+      ..addOption('repo', abbr: 'r', help: 'Repository URL')
+      ..addOption('branch', abbr: 'b', defaultsTo: 'main', help: 'Repository branch')
+      ..addOption('description', abbr: 'd', help: 'Template description')
+      ..addMultiOption('command', abbr: 'c', help: 'Post-create commands')
+      ..addMultiOption('var', help: 'Template variables (format: key=value)')
+      ..addFlag('cache', help: 'Cache template after adding', defaultsTo: true);
+  }
+
+  @override
+  Future<void> run() async {
+    final name = argResults?['name'];
+    final repoUrl = argResults?['repo'];
+    final branch = argResults?['branch'];
+    final description = argResults?['description'];
+    final commands = argResults?['command'] as List<String>? ?? [];
+    final cache = argResults?['cache'] ?? true;
+
+    if (name == null || repoUrl == null) {
+      print('Please provide template name and repository URL');
+      return;
+    }
+
+    final variables = <String, String>{};
+    for (final var_ in argResults?['var'] ?? []) {
+      final parts = var_.split('=');
+      if (parts.length == 2) {
+        variables[parts[0]] = parts[1];
+      }
+    }
+
+    final logger = Logger();
+    final templateManager = TemplateManager();
+
+    logger.info('Validating template...');
+    if (!await templateManager.validateTemplate(repoUrl, branch)) {
+      logger.err('Invalid template repository');
+      return;
+    }
+
+    final template = Template(
+      name: name,
+      repoUrl: repoUrl,
+      branch: branch,
+      description: description,
+      postCreateCommands: commands,
+      variables: variables,
+    );
+
+    templateManager.addTemplate(template);
+    logger.success('Template added successfully!');
+
+    if (cache) {
+      logger.info('Caching template...');
+      await templateManager.cacheTemplate(template);
+      logger.success('Template cached successfully!');
+    }
+  }
+}

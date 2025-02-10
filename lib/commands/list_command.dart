@@ -1,4 +1,5 @@
 import 'package:args/command_runner.dart';
+import 'package:mason_logger/mason_logger.dart';
 import '../services/template_manager.dart';
 
 class ListCommand extends Command {
@@ -10,22 +11,39 @@ class ListCommand extends Command {
 
   @override
   void run() {
+    final logger = Logger();
     final templates = TemplateManager().listTemplates();
     
     if (templates.isEmpty) {
-      print('No templates available.');
+      logger.warn('No templates available.');
       return;
     }
 
-    print('Available templates:');
+    logger.info('Available templates:');
     for (final template in templates) {
-      print('\n${template.name}:');
-      print('  Repository: ${template.repoUrl}');
-      if (template.postCreateCommands.isNotEmpty) {
-        print('  Post-create commands:');
-        for (final cmd in template.postCreateCommands) {
-          print('    - $cmd');
+      logger.info('\n${template.name}:');
+      if (template.description != null) {
+        logger.info('  Description: ${template.description}');
+      }
+      logger.info('  Repository: ${template.repoUrl}');
+      logger.info('  Branch: ${template.branch}');
+      
+      if (template.variables.isNotEmpty) {
+        logger.info('  Variables:');
+        for (final entry in template.variables.entries) {
+          logger.info('    - ${entry.key}: ${entry.value}');
         }
+      }
+      
+      if (template.postCreateCommands.isNotEmpty) {
+        logger.info('  Post-create commands:');
+        for (final cmd in template.postCreateCommands) {
+          logger.info('    - $cmd');
+        }
+      }
+
+      if (template.cached) {
+        logger.info('  Cached: Yes${template.lastUsed != null ? ' (Last used: ${template.lastUsed})' : ''}');
       }
     }
   }

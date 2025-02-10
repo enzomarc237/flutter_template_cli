@@ -1,23 +1,20 @@
-class Template {
-  final String name;
-  final String repoUrl;
-  final List<String> postCreateCommands;
+import 'package:freezed_annotation/freezed_annotation.dart';
 
-  Template({
-    required this.name,
-    required this.repoUrl,
-    this.postCreateCommands = const [],
-  });
+part 'template.freezed.dart';
+part 'template.g.dart';
 
-  Map<String, dynamic> toJson() => {
-        'name': name,
-        'repoUrl': repoUrl,
-        'postCreateCommands': postCreateCommands,
-      };
+@freezed
+class Template with _$Template {
+  factory Template({
+    required String name,
+    required String repoUrl,
+    @Default([]) List<String> postCreateCommands,
+    @Default('main') String branch,
+    String? description,
+    @Default({}) Map<String, String> variables,
+    @Default(false) bool cached,
+    DateTime? lastUsed,
+  }) = _Template;
 
-  factory Template.fromJson(Map<String, dynamic> json) => Template(
-        name: json['name'],
-        repoUrl: json['repoUrl'],
-        postCreateCommands: List<String>.from(json['postCreateCommands'] ?? []),
-      );
+  factory Template.fromJson(Map<String, dynamic> json) => _$TemplateFromJson(json);
 }
