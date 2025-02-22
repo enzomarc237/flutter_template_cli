@@ -2,6 +2,8 @@ import 'dart:io';
 
 import 'package:mason_logger/mason_logger.dart';
 import 'package:path/path.dart' as path;
+import 'package:yaml/yaml.dart';
+import 'package:yaml_edit/yaml_edit.dart';
 import 'git_service.dart';
 import 'template_manager.dart';
 
@@ -37,20 +39,26 @@ class ProjectCreator {
       await copyPath(sourceDir, projectPath);
     }
 
-    // Apply template variables
-    final allVariables = {
-      ...template.variables,
-      ...variables,
-      'project_name': path.basename(projectPath),
-    };
+    // Get the original project name from pubspec.yaml
+    final pubspecFile = File(path.join(projectPath, 'pubspec.yaml'));
+    if (!pubspecFile.existsSync()) {
+      _logger.err('pubspec.yaml not found in template');
+      return false;
+    }
 
-    await _processTemplateFiles(projectPath, allVariables);
+    final pubspecContent = await pubspecFile.readAsString();
+    final pubspecYaml = loadYaml(pubspecContent);
+    final originalProjectName = pubspecYaml['name'] as String;
+
+    // Replace project name in files
+    _logger.info('Updating project files with new name...');
+    await _updateProjectFiles(projectPath, originalProjectName, path.basename(projectPath));
 
     // Execute post-create commands
     _logger.info('Running post-create commands...');
     for (final command in template.postCreateCommands) {
       try {
-        final expandedCommand = _expandVariables(command, allVariables);
+        final expandedCommand = _expandVariables(command, variables);
         final parts = expandedCommand.split(' ');
 
         _logger.info('Executing: $expandedCommand');
@@ -76,6 +84,7 @@ class ProjectCreator {
     return true;
   }
 
+
   Future<void> copyPath(String source, String destination) async {
     final sourceDir = Directory(source);
     final destDir = Directory(destination);
@@ -85,10 +94,14 @@ class ProjectCreator {
     }
 
     await for (final entity in sourceDir.list(recursive: false)) {
+      final name = path.basename(entity.path);
+      if (name.startsWith('.')) {
+        continue; // Skip hidden files and directories
+      }
       if (entity is File) {
-        await entity.copy('${destDir.path}/${entity.uri.pathSegments.last}');
+        await entity.copy('${destDir.path}/${name}');
       } else if (entity is Directory) {
-        await copyPath(entity.path, '${destDir.path}/${entity.uri.pathSegments.last}');
+        await copyPath(entity.path, '${destDir.path}/${name}');
       }
     }
   }
@@ -140,5 +153,136 @@ class ProjectCreator {
       'wasm', // WebAssembly
       'tflite', 'mlmodel', // Machine Learning models
     ].contains(extension);
+  }
+
+  Future<void> _updateProjectFiles(String projectPath, String originalName, String newName) async {
+    final files = await _findFilesToUpdate(projectPath);
+
+    for (final file in files) {
+      _logger.info('Updating ${path.basename(file.path)}...');
+
+      if (file.path.endsWith('.yaml')) {
+        await _updateYamlFile(file, originalName, newName);
+      } else {
+        await _updateTextFile(file, originalName, newName);
+      }
+    }
+  }
+
+  Future<List<File>> _findFilesToUpdate(String projectPath) async {
+    final files = <File>[];
+
+    await for (final entity in Directory(projectPath).list(recursive: true)) {
+      if (entity is File) {
+        final filename = path.basename(entity.path).toLowerCase();
+
+        // Add files that commonly contain project name references
+        if ([
+              'pubspec.yaml',
+              'package_config.json',
+              'android/app/build.gradle',
+              'android/app/src/main/AndroidManifest.xml',
+              'ios/Runner.xcodeproj/project.pbxproj',
+              'ios/Runner/Info.plist',
+              'macos/Runner/Configs/AppInfo.xcconfig',
+              'windows/runner/main.cpp',
+              'linux/CMakeLists.txt',
+              'web/index.html',
+              'web/manifest.json',
+              'README.md',
+            ].contains(entity.path.substring(projectPath.length + 1)) ||
+            filename.endsWith('.dart')) {
+          files.add(entity);
+        }
+      }
+    }
+
+    return files;
+  }
+
+  Future<void> _updateYamlFile(File file, String originalName, String newName) async {
+    try {
+      final content = await file.readAsString();
+      final yamlEditor = YamlEditor(content);
+
+      if (file.path.endsWith('pubspec.yaml')) {
+        yamlEditor.update(['name'], newName);
+
+        // Update description if it contains the project name
+        final currentDescription = yamlEditor.parseAt(['description'], orElse: () => loadYamlNode("")) as String;
+        if (currentDescription.contains(originalName)) {
+          yamlEditor.update(
+            ['description'],
+            currentDescription.replaceAll(originalName, newName),
+          );
+        }
+      }
+
+      await file.writeAsString(yamlEditor.toString());
+    } catch (e) {
+      _logger.warn('Error updating YAML file ${file.path}: $e');
+    }
+  }
+
+  Future<void> _updateTextFile(File file, String originalName, String newName) async {
+    try {
+      final content = await file.readAsString();
+
+      // Create regex patterns for different name formats
+      final patterns = [
+        RegExp(originalName, caseSensitive: true),
+        RegExp(_toSnakeCase(originalName), caseSensitive: true),
+        RegExp(_toCamelCase(originalName), caseSensitive: true),
+        RegExp(_toPascalCase(originalName), caseSensitive: true),
+        RegExp(_toKebabCase(originalName), caseSensitive: true),
+      ];
+
+      var newContent = content;
+      for (final pattern in patterns) {
+        newContent = newContent.replaceAll(
+          pattern,
+          _matchCase(pattern.pattern, newName),
+        ); // Use replaceAllMapped to preserve case
+      }
+
+      await file.writeAsString(newContent);
+    } catch (e) {
+      _logger.warn('Error updating file ${file.path}: $e');
+    }
+  }
+
+  String _matchCase(String original, String newText) {
+    if (original.contains('_')) {
+      return _toSnakeCase(newText);
+    } else if (original[0].toLowerCase() == original[0]) {
+      return _toCamelCase(newText);
+    } else if (original[0].toUpperCase() == original[0]) {
+      return _toPascalCase(newText);
+    } else if (original.contains('-')) {
+      return _toKebabCase(newText);
+    }
+    return newText;
+  }
+
+  String _toSnakeCase(String text) => text.replaceAll('-', '_').replaceAll(' ', '_').toLowerCase();
+
+  String _toCamelCase(String text) {
+    final words = text.split(RegExp(r'[_\- ]'));
+    return words[0].toLowerCase() + words.skip(1).map((word) => word.capitalize()).join();
+  }
+
+  String _toPascalCase(String text) {
+    final words = text.split(RegExp(r'[_\- ]'));
+    return words.map((word) => word.capitalize()).join();
+  }
+
+  String _toKebabCase(String text) => text.replaceAll('_', '-').replaceAll(' ', '-').toLowerCase();
+}
+
+// Add this extension method
+extension StringExtension on String {
+  String capitalize() {
+    if (isEmpty) return this;
+    return '${this[0].toUpperCase()}${substring(1).toLowerCase()}';
   }
 }

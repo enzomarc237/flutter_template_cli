@@ -1,4 +1,4 @@
-import 'dart:convert';
+ import 'dart:convert';
 import 'dart:io';
 import 'package:collection/collection.dart';
 import 'package:path/path.dart' as path;
@@ -85,7 +85,15 @@ class TemplateManager {
 
     final cacheFolder = path.join(_cacheDir.path, template.name);
     if (Directory(cacheFolder).existsSync()) {
-      await Process.run('git', ['pull'], workingDirectory: cacheFolder);
+      try {
+        final result = await Process.run('git', ['pull'], workingDirectory: cacheFolder);
+        if (result.exitCode != 0) {
+          // If git pull fails, re-cache the template
+          await cacheTemplate(template);
+        }
+      } catch (e) {
+        await cacheTemplate(template); // Re-cache if git pull fails
+      }
     } else {
       await cacheTemplate(template);
     }
